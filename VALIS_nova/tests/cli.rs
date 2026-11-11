@@ -69,10 +69,42 @@ fn separate_stages_private_source_key_reuse_and_tampering() {
     .unwrap();
     run(&["verify", "changed.json", "vk.bin", "proof.bin"], false);
 
+    // 只改变删除内容，编辑规则仍合法，但必须被原文承诺拒绝。
+    fs::write(dir.join("different-source.txt"), "aHIDDENb").unwrap();
+    run(
+        &[
+            "prove",
+            "different-source.txt",
+            "public.json",
+            "pk.bin",
+            "wrong-source.bin",
+        ],
+        false,
+    );
+    let mut changed_commitment = public.clone();
+    changed_commitment["before_commitment"] = serde_json::json!("00".repeat(32));
+    fs::write(
+        dir.join("changed-commitment.json"),
+        serde_json::to_vec(&changed_commitment).unwrap(),
+    )
+    .unwrap();
+    run(
+        &["verify", "changed-commitment.json", "vk.bin", "proof.bin"],
+        false,
+    );
+
     // 相同形状、不同新文和操作类型，仍复用原 pk/vk，不调用 setup。
     changed = public.clone();
     changed["after"] = serde_json::json!([97, 99]);
     changed["edits"] = serde_json::json!([{"Keep":1},{"Delete":7},{"Insert":[99]}]);
+    fs::write(dir.join("second-source.txt"), "aHIDDENb").unwrap();
+    run(
+        &["diff", "second-source.txt", "new.txt", "second-source.json"],
+        true,
+    );
+    let second_source: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("second-source.json")).unwrap()).unwrap();
+    changed["before_commitment"] = second_source["before_commitment"].clone();
     fs::write(
         dir.join("second.json"),
         serde_json::to_vec(&changed).unwrap(),
@@ -171,7 +203,7 @@ fn separate_stages_private_source_key_reuse_and_tampering() {
     // 旧版参数格式仍明确拒绝，不能静默复用。
     let mut old_key = vk_before.clone();
     old_key.splice(
-        ..b"VALIS-NOVA-PRIVATE-BYTES-V2\0".len(),
+        ..b"VALIS-NOVA-SOURCE-BLOCK-V4\0".len(),
         b"VALIS-NOVA-PRIVATE-V1\0".iter().copied(),
     );
     fs::write(dir.join("legacy-vk.bin"), old_key).unwrap();
@@ -179,4 +211,36 @@ fn separate_stages_private_source_key_reuse_and_tampering() {
         &["verify", "public.json", "legacy-vk.bin", "proof.bin"],
         false,
     );
+}
+
+#[test]
+fn source_fragments_across_nova_steps() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("cli-fragments-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let source: Vec<u8> = (0..65).collect();
+    let mut target = vec![255];
+    target.extend_from_slice(&source[..33]);
+    target.push(254);
+    fs::write(dir.join("old.bin"), source).unwrap();
+    fs::write(dir.join("new.bin"), target).unwrap();
+    for args in [
+        vec!["diff", "old.bin", "new.bin", "public.json"],
+        vec!["setup", "public.json", "pk.bin", "vk.bin"],
+        vec!["prove", "old.bin", "public.json", "pk.bin", "proof.bin"],
+        vec!["verify", "public.json", "vk.bin", "proof.bin"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_valis-nova-demo"))
+            .current_dir(&dir)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

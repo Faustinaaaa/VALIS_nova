@@ -1,6 +1,8 @@
 mod artifact;
 mod circuit;
 mod gadgets;
+mod hashchain;
+mod metrics;
 mod myers;
 mod statement;
 
@@ -29,11 +31,17 @@ fn read_statement(path: impl AsRef<Path>) -> Result<Statement> {
 }
 
 fn main() -> Result<()> {
+    let result = run();
+    // 失败命令也报告已发生的进程内存峰值。
+    metrics::print_memory();
+    result
+}
+
+fn run() -> Result<()> {
     let args: Vec<_> = env::args_os().collect();
     let command = args.get(1).and_then(|s| s.to_str()).unwrap_or("");
     match (command, args.len()) {
         ("diff", 5) => {
-            // 两个输入允许是同一文件，但输出不能覆盖任一输入。
             distinct_paths(&[Path::new(&args[2]), Path::new(&args[4])])?;
             distinct_paths(&[Path::new(&args[3]), Path::new(&args[4])])?;
             let before = fs::read(&args[2])?;
@@ -46,6 +54,7 @@ fn main() -> Result<()> {
             }
             let public = Statement {
                 before_len: before.len(),
+                before_commitment: hashchain::encode(hashchain::commitment(&before)),
                 after,
                 edits,
             };
@@ -65,6 +74,7 @@ fn main() -> Result<()> {
             let start = Instant::now();
             let pp = PP::setup(&circuit, &*S1::ck_floor(), &*S2::ck_floor())?;
             let pp_time = start.elapsed();
+            metrics::print_constraints(&pp);
             let phase = Instant::now();
             let (pk, vk) = Proof::setup(&pp)?;
             let key_time = phase.elapsed();
@@ -87,17 +97,22 @@ fn main() -> Result<()> {
             let before = fs::read(&args[2])?;
             let public = read_statement(&args[3])?;
             let (mut circuit, z0) = public.circuit()?;
-            circuit.set_source(&before)?;
+            let tape = circuit::chunks(&public.edits);
+            // new 会执行第一步，必须先装入第 0 块。首次 prove_step 仅登记该步。
+            let mut source_offset = circuit.set_source_step(&before, 0, &tape[0])?;
             let shape = Shape::from(&circuit);
             let (pp, pk): (PP, PK) = load(&args[4], "prover", &shape)?;
+            metrics::print_constraints(&pp);
             let phase = Instant::now();
             let mut recursive = RecursiveSNARK::new(&pp, &circuit, &z0)?;
             let mut recursive_time = phase.elapsed();
-            for i in 0..circuit.steps {
+            for (i, edit) in tape.iter().enumerate() {
+                if i > 0 {
+                    source_offset = circuit.set_source_step(&before, source_offset, edit)?;
+                }
                 let phase = Instant::now();
                 recursive.prove_step(&pp, &circuit)?;
                 recursive_time += phase.elapsed();
-                println!("Proved block {}/{}", i + 1, circuit.steps);
             }
             let phase = Instant::now();
             let output = recursive.verify(&pp, circuit.steps, &z0)?;

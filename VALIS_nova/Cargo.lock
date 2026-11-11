@@ -1046,6 +1046,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "ff",
+ "generic-array 1.4.5",
  "nova-snark",
  "serde",
  "serde_json",

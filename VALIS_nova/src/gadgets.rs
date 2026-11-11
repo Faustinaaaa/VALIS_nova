@@ -153,3 +153,34 @@ pub(crate) fn equal_if<CS: ConstraintSystem<F>>(mut cs: CS, enabled: &Num, a: &N
         |lc| lc,
     );
 }
+
+/// 要求已消费长度不超过原文长度。剩余长度拆成 8 个字节，不能为负。
+/// 从零开始的游标每步最多增加 BLOCK，不会接近业务域的模数。
+pub(crate) fn enforce_source_bound<CS: ConstraintSystem<F>>(
+    mut cs: CS,
+    consumed: &Num,
+    old_len: usize,
+) -> Result<(), SynthesisError> {
+    let mut bytes = Vec::new();
+    for i in 0..8 {
+        let byte = Num::alloc(cs.namespace(|| format!("remaining byte {i}")), || {
+            let remaining = scalar(old_len) - value(consumed)?;
+            Ok(F::from(remaining.to_repr().as_ref()[i] as u64))
+        })?;
+        enforce_byte(cs.namespace(|| format!("remaining range {i}")), &byte)?;
+        bytes.push(byte);
+    }
+    cs.enforce(
+        || "consumed plus remaining equals length",
+        |mut lc| {
+            lc = lc + consumed.get_variable();
+            for (i, byte) in bytes.iter().enumerate() {
+                lc = lc + (F::from(1u64 << (8 * i)), byte.get_variable());
+            }
+            lc
+        },
+        |lc| lc + CS::one(),
+        |lc| lc + (scalar(old_len), CS::one()),
+    );
+    Ok(())
+}
