@@ -4,3 +4,6 @@
 /vk.bin
 /proof.bin
 /public.json
+
+# 私有原文承诺的盐，不能上传
+*.salt

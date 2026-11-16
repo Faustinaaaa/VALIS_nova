@@ -38,8 +38,7 @@ impl Statement {
         // 计算初始状态需要多少个 F 元素，不是计算文件有多少字节。
         let state_len = blocks
             .checked_mul(2 + BLOCK)
-            .and_then(|n| n.checked_add(self.after.len()))
-            .and_then(|n| n.checked_add(6))
+            .and_then(|n| n.checked_add(8))
             .ok_or("encoded state size overflow")?;
         // 检查两个数组的大小：初始状态数组，以及固定容量的私有原文片段。
         for len in [state_len, BLOCK] {

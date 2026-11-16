@@ -1,8 +1,59 @@
+# 当前版本说明
+
+## V6：双侧片段输入（当前实现）
+
+“流式新文”指电路每步只接收当前片段。CLI 仍将 public.json 的 after 数组读取到普通内存，没有改成磁盘文件的流式 JSON 解析。新文仍然公开，只是不再全文放进 Nova 状态。
+
+每步固定分配原文、新文各 32 个字节槽。set_target_step(after, offset, edit) 装入新文片段，返回下一步偏移：keep 消费 n 字节，insert 消费插入长度，delete 不消费。未用槽填零，越界候选也填零后由电路上界检查拒绝。Nova::new 前装入首块，首次 prove_step 保留它，之后每步更换两侧片段。
+
+状态布局为：
+
+~~~text
+z[0] = 原文游标
+z[1] = 新文游标
+z[2] = 操作游标
+z[3] = 原文长度
+z[4] = 新文目标承诺
+z[5] = 新文动态哈希链
+z[6 .. len-2] = 全部操作块
+z[len-2] = 原文目标承诺
+z[len-1] = 原文动态哈希链
+~~~
+
+状态长度现在为 8 + 34 × steps，与新文字节数无关。每一步直接比较两个片段的同一槽位，不再用新文全文选择器。keep 要求两侧字节相等；insert 要求新文字节等于公开操作中的插入字节。
+
+新文链不需要盐，初始为 0，使用独立域标记：
+
+~~~text
+h_next = Poseidon(0x56414c495304, h, byte)
+C_new = Poseidon(0x56414c495305, final_h, new_len)
+~~~
+
+keep/insert 的有效字节进入新文链，delete 和填充槽不更新。每步固定生成 32 组候选新文哈希；原文带盐哈希链保持不变。电路两侧都检查 consumed + remaining == 文件长度，remaining 限制为非负 64 位整数。
+
+EditCircuit::statement 在电路外根据公开 after 计算 C_new，验证者也执行相同计算，不接受任意替换的新文承诺。completed 检查两侧完整消费、两条链分别匹配承诺、初始链为零及固定状态不变。变化的状态只有三个游标、z[5] 和最后一项。
+
+操作表仍随块数增长；old_len/new_len 仍为电路常量及 Shape 参数，所以不同长度仍不能复用 setup。约束数不随新文长度增长，不等于约束内容完全相同。
+
+V6 改变了电路与状态布局，旧 V5 密钥和证明不能复用，需重新 setup/prove。已有 V5 public.json 和 private.salt 可以继续使用，命令格式不变，无需重新 diff。
+
+单步分类统计命令：
+
+~~~powershell
+cargo run --release -- constraints public.json
+~~~
+
+该命令按实际生成的约束路径分类，包含 source hashchain、target hashchain、salted initialization、字节范围、操作选择、keep/insert 和游标上界等。它只构造业务电路形状，不运行证明；其内存不代表 prove 内存。setup/prove 原有的 Nova R1CS 总计包含递归包装，与此业务计数不同。
+
+---
+
+以下为完整流程及历史演进说明，V4/V5 兼容性记录以开头 V6 说明为准。
+
 # 文件差异证明：从 main 到单步电路
 
 本文对应当前 VALIS_nova 代码，按 main 的执行顺序介绍每个阶段：谁调用谁、传入什么、得到什么，以及电路如何检查编辑操作。
 
-当前使用 nova-snark 0.76.0，每个编辑块最多处理 **32 个字节**。每步私有输入只包含当前块的 32 个原文字节槽，新文和操作表仍完整保留。当前已加入 Poseidon 原文哈希链，公开承诺绑定完整原文，包括删除内容。文件使用 fs::read 读取，所有长度和游标都按字节计数，不按 Unicode 字符计数。文件可以包含非 UTF-8 数据；中文字符也可能被拆到两个块里。
+当前使用 nova-snark 0.76.0，每个编辑块最多处理 **32 个字节**。每步只接收两侧各 32 字节的片段，操作表仍完整保留。当前已加入 Poseidon 原文哈希链，公开承诺绑定完整原文，包括删除内容。文件使用 fs::read 读取，所有长度和游标都按字节计数，不按 Unicode 字符计数。文件可以包含非 UTF-8 数据；中文字符也可能被拆到两个块里。
 
 ## 1. 从程序入口看整个流程
 
@@ -18,9 +69,9 @@ verify： public.json + vk.bin + proof.bin → 接受或报错
 在 VALIS_nova 目录下运行：
 
 ~~~powershell
-cargo run --release -- diff examples/old.txt examples/new.txt public.json
+cargo run --release -- diff examples/old.txt examples/new.txt public.json private.salt
 cargo run --release -- setup public.json pk.bin vk.bin
-cargo run --release -- prove examples/old.txt public.json pk.bin proof.bin
+cargo run --release -- prove examples/old.txt public.json pk.bin proof.bin private.salt
 cargo run --release -- verify public.json vk.bin proof.bin
 ~~~
 
@@ -77,7 +128,8 @@ main 的 diff 分支
   → fs::read(新文件路径) → after
   → myers_diff(&before, &after) → edits
   → 打印每条 edit
-  → hashchain::commitment(&before) → 承诺域元素
+  → 从指定的 private.salt 读取已有盐，或由系统随机源生成并保存新盐
+  → hashchain::commitment(&before, salt) → 承诺域元素
   → hashchain::encode(承诺) → 十六进制字符串
   → 构造 Statement { before_len, before_commitment, after, edits }
   → public.circuit()
@@ -240,7 +292,7 @@ source_block 暂时全零。setup 只需要形状，verify 不需要原文；pro
 然后建立初始状态：
 
 ~~~text
-z0 = [0, 0, 0, 原文长度, 新文字节..., 全部操作块的编码..., 目标承诺 C, 当前链状态 h=0]
+z0 = [0, 0, 0, 原文长度, 新文承诺, 新文链初始值 0, 全部操作块的编码..., 目标承诺 C, 当前链状态 h=0]
       ↑  ↑  ↑
       原文游标、新文游标、操作游标
 ~~~
@@ -267,7 +319,7 @@ keep/delete 不使用插入数据槽，因此全部填零。insert 写入有效�
 
 scalar(n) 是编码时的小工具，输入 usize 整数，输出对应的 F。
 
-例子中 z0 长度是 6 + 12 + 34 × 3 = 120。整张操作表都在里面，后续每一步根据操作游标选择一行。
+例子中 z0 长度是 8 + 34 × 3 = 110。整张操作表都在里面，后续每一步根据操作游标选择一行。
 
 ### 4.5 原文长度为什么放在 z[3]
 
@@ -340,12 +392,14 @@ main 的 prove 分支
   → fs::read(原文件) → before
   → read_statement(public.json) → public
   → public.circuit() → (circuit, z0)
+  → 读取 private.salt，decode 后调用 circuit.set_salt(salt)
   → chunks(&public.edits) → tape
   → circuit.set_source_step(&before, 0, &tape[0]) → source_offset
+  → circuit.set_target_step(&public.after, 0, &tape[0]) → target_offset
   → Shape::from(&circuit) → shape
   → load(pk.bin, "prover", &shape) → (pp, pk)
   → RecursiveSNARK::new(&pp, &circuit, &z0) → recursive
-  → 循环 steps 次：第 0 次保留首块，其余先 set_source_step 装入本步片段
+  → 循环 steps 次：第 0 次保留首块，其余先 set_source_step 和 set_target_step 装入两侧片段
   → recursive.prove_step(&pp, &circuit)
 ~~~
 
@@ -356,7 +410,7 @@ set_source_step(&mut self, before: &[u8], offset: usize, edit: &Edit)
     -> Result<usize, String>
 ~~~
 
-输入完整原文的借用、原文偏移和当前编辑块。完整原文只存在 main 的普通内存里，不进入每步电路。
+prove 先从私有盐文件读取规范域元素并调用 set_salt。随后输入完整原文的借用、原文偏移和当前编辑块。完整原文只存在 main 的普通内存里，不进入每步电路。
 
 keep/delete 从 offset 开始最多取 32 字节放进 source_block，剩余槽填零；insert 不取原文，全部填零。返回下一步原文偏移。它只准备 witness，不比较 keep/insert 内容或原文承诺。
 
@@ -380,7 +434,7 @@ EditCircuit 实现 StepCircuit<F>。StepCircuit 是 Nova 要求的单步电路�
 
 ~~~rust
 fn arity(&self) -> usize
-// 返回 6 + new_len + 34 * steps
+// 返回 8 + 34 * steps
 
 fn synthesize<CS: ConstraintSystem<F>>(
     &self,
@@ -409,24 +463,9 @@ Num::alloc 提供一个候选赋值；cs.enforce、Num::mul 等写出的约束�
 
 未消费的槽也检查字节范围，但不参与 keep 比较或哈希链更新。CLI 将填充槽写为零；正确性不依赖这些无用槽一定为零。
 
-### 7.2 从 z 中取出新文和操作表
+### 7.2 分配新文片段
 
-布局为：
-
-~~~text
-z[0]                  原文游标
-z[1]                  新文游标
-z[2]                  操作游标
-z[3]                  原文总字节数
-z[4 .. 4+new_len]      新文字节
-z[4+new_len .. len-2]  操作表，每行 34 个数
-z[len-2]              目标原文承诺 C
-z[len-1]              当前哈希链状态 h
-~~~
-
-先通过 cs.enforce 要求 z[3] 等于 self.old_len，再对新文所有字节调用 enforce_byte。
-
-原文游标表示下一次从原文哪个字节开始消费，新文游标表示下一次匹配新文的哪个位置。这是电路中的数组索引，不是每步重新读取磁盘。
+用 Num::alloc 分配 target_block 的 32 个字节，并逐个 enforce_byte。完整新文不在状态中；状态布局见本文开头 V6 说明。操作表从 z[6] 开始，新文目标承诺在 z[4]，动态链在 z[5]。
 
 ### 7.3 根据操作游标选出当前行
 
@@ -446,6 +485,8 @@ selectors(cs, index=z[2], enabled=one, count=steps) → row_bits
 取出该列的所有行 → entries
 select(cs, row_bits, entries) → 当前行的这一列
 ~~~
+
+选择行后还分配私有 salt，调用 initialize_if(cs, chain, salt, row_bits[0])：第一步先初始化带盐链，其它步骤不改变已有链。
 
 得到 row，其中包含操作类型、有效长度和 32 个数据槽。34 列共用同一组 row_bits，因此不能从不同操作行拼接字段。
 
@@ -494,27 +535,9 @@ new_enabled = active × reads_new
 
 通过 Num::mul 添加乘法约束。无效槽两边都不读，delete 的有效槽只读原文，insert 的有效槽只读新文。
 
-**第三步：计算候选读取位置。**
+**第三、四步：直接读取片段槽位。**
 
-~~~text
-new_index = z[1] + slot
-~~~
-
-新文位置调用 sum 约束。原文直接使用当前片段的第 slot 个字节，不再通过全文索引查找。
-
-**第四步：从对应位置选择字节。**
-
-~~~text
-selectors(cs, new_index, new_enabled, new_len) → new_bits
-old[slot] → old_char
-select(cs, new_bits, new) → new_char
-~~~
-
-新文查找启用时必须选中指定位置，越界就不能满足约束；停用时选择位全零。原文不再查表：本步消费数受有效长度控制，内容通过哈希链绑定，原文上界在更新游标后单独检查。
-
-这样最后一个短块才能正常工作：只剩 2 字节时，其余 30 个槽仍有约束，但不会真的要求读取文件末尾之外的字节。
-
-old_char 和 new_char 虽然名字有 char，当前含义仍然是字节。
+old_char = old[slot]，new_char = new[slot]。两侧均不再生成全文查找选择器。消费上界由游标约束保证，片段内容和顺序由哈希链绑定。
 
 **第五步：检查对应的编辑关系。**
 
@@ -549,7 +572,9 @@ keep/delete 的有效槽会更新链，insert 和填充槽保留原值。每步�
 next[0] = z[0] + 所有 old_enabled 之和
 next[1] = z[1] + 所有 new_enabled 之和
 next[2] = z[2] + 1
-next[3 .. len-1] = z[3 .. len-1]
+next[3..5] = z[3..5]
+next[5] = 本步新文链
+next[6 .. len-1] = z[6 .. len-1]
 next[len-1] = 本步处理后的哈希链状态
 ~~~
 
@@ -669,7 +694,10 @@ output[0] == old_len
 output[1] == new_len
 output[2] == steps
 initial 的末尾链状态 == 0
-output[3 .. len-1] == initial[3 .. len-1]
+initial[5] == 0
+output[3..5] == initial[3..5]
+output[6 .. len-1] == initial[6 .. len-1]
+target_finish(output[5], new_len) == initial[4]
 hashchain::finish(output[len-1], old_len) == initial[len-2]
 ~~~
 
@@ -717,7 +745,7 @@ verify 不读取原文件，不调用 set_source_step，不重新执行 Myers。
 MAGIC 格式标记 + bincode 编码的 (kind, shape, value)
 ~~~
 
-当前格式标记为 VALIS-NOVA-SOURCE-BLOCK-V4，末尾还带一个零字节。这是二进制格式标识，与已删除的 JSON version 字段不是一回事。
+当前格式标记为 VALIS-NOVA-DUAL-STREAM-V6，末尾还带一个零字节。这是二进制格式标识，与已删除的 JSON version 字段不是一回事。
 
 kind 为 prover、verifier 或 proof。value 分别是 (pp,pk)、vk 或压缩证明。
 
@@ -754,7 +782,7 @@ chunks 和 EditCircuit::statement 中的 match 在电路外拆分、编码数据
 | 尺寸 | 影响 |
 | --- | --- |
 | old_len | 仍作为长度绑定和上界约束的常量，并保留在 Shape 中；不再决定私有变量数或原文查找表大小 |
-| new_len | 状态长度、新文范围检查数、新文查找长度 |
+| new_len | 消费上界的常量；不再决定状态长度、范围检查数或查找规模 |
 | steps | 操作表长度、操作行选择器大小 |
 | BLOCK | 每行宽度、槽位数量、长度选择器大小 |
 
@@ -773,11 +801,12 @@ chunks 和 EditCircuit::statement 中的 match 在电路外拆分、编码数据
 使用 nova-snark 0.76.0 内置的 Poseidon 实现，不自行设计轮常数。参数为业务电路的 F 域、U5 sponge、Strength::Standard、Simplex 模式。每次使用固定 IO 模式 Absorb(3)、Squeeze(1)，输出完整域元素，不截断。
 
 ~~~text
-h₀ = 0
+h₀ = Poseidon(INIT_DOMAIN, 0, salt)
 hᵢ₊₁ = Poseidon(BYTE_DOMAIN, hᵢ, 原文字节ᵢ)
 C = Poseidon(FINAL_DOMAIN, hₙ, 原文长度)
 BYTE_DOMAIN  = 0x56414c495301
 FINAL_DOMAIN = 0x56414c495302
+INIT_DOMAIN  = 0x56414c495303
 ~~~
 
 hashchain.rs 中的调用关系：
@@ -787,7 +816,7 @@ hashchain.rs 中的调用关系：
 | constants() | 无 | OnceLock 缓存的 Poseidon 参数，电路内外共用 |
 | pattern() | 无 | 固定吸收 3 个元素、输出 1 个元素的 IO 模式 |
 | hash(domain, state, item) | 域标记、链状态、字节或长度 | 普通 Rust Poseidon 结果，调用 constants 和 pattern |
-| commitment(bytes) | 原文全部字节 | 从零开始逐字节调用 hash，再调用 finish，返回 C |
+| commitment(bytes, salt) | 原文全部字节、私有盐 | 先计算带盐初始链，再逐字节调用 hash，最后调用 finish 返回 C |
 | finish(state, len) | 最终链状态、原文长度 | 使用 FINAL_DOMAIN 调用 hash，得到最终承诺 |
 | absorb_if(cs, state, byte, enabled) | 约束容器、链状态、字节、启用位 | 用相同参数生成 Poseidon 约束，再约束条件选择，返回下一链变量 |
 | encode(value) | 承诺域元素 | 将 to_repr 小端字节编码为 64 位小写十六进制字符串 |
@@ -795,13 +824,13 @@ hashchain.rs 中的调用关系：
 
 diff 调用 commitment 和 encode 写入 JSON。各阶段的 Statement::circuit 调用 decode，仅做格式检查。prove 不预先比较 witness 的承诺，而是由单步链更新和 completed 的终态匹配保证正确性。
 
-哈希按字节计算，因此相同原文无论如何拆分编辑操作，承诺都一样。长度最终绑定区分不同长度的消息，两个域标记区分字节更新和结束操作。
+哈希按字节计算，因此相同原文无论如何拆分编辑操作，承诺都一样。长度最终绑定区分不同长度的消息，三个域标记区分带盐初始化、字节更新和结束操作。
 
 完整验证通过表示：存在一份匹配公开承诺的私有原文，能够按脚本得到公开新文。每步只分配当前原文片段，消费字节通过递归链状态按顺序累计，最终绑定到同一承诺。验证者必须事先认可 C 属于预期原文件；如果证明者同时替换原文和 C，不能仅凭证明确认外部文件身份。
 
 最终链值属于证明的最终状态，应视为公开数据，不依赖其保密性。
 
-当前实现没有随机盐，承诺不保证对可猜测原文的隐藏性；攻击者可以猜测原文并离线比较承诺。新文、原文长度和脚本也仍公开，keep 内容可从新文推断。
+当前使用系统随机源生成的私有盐。盐不公开，也不将带盐初始链值放入 z0；仅知道公开承诺不能直接枚举原文并比较无盐哈希。若盐泄露，可猜测的原文仍可能被离线枚举。新文、原文长度和脚本也仍公开，keep 内容可从新文推断。
 
 本次增加两个状态字段和每步32 组 Poseidon 约束，必须重新 diff/setup/prove。旧无承诺 JSON 和 V2 产物不能复用。新参数可以用于相同尺寸但不同承诺的输入。原文承诺不再允许仅改变删除内容而保持同一公开语句通过证明。
 
@@ -829,13 +858,13 @@ cargo test --release
 
 阅读代码时，按本文顺序从 main 的 diff 开始，进入 Statement::circuit，再回到 setup/prove，在 prove_step 处查看 synthesize，最后回到 completed 和 verify，就能将数据准备、单步规则、递归证明和最终接受条件对应起来。
 
-当前 BLOCK 为 32。原文片段优化前的所有参数（包括旧 32 字节版本）均需重新 setup/prove；已有带承诺的 JSON 可以继续使用，承诺算法没有变化。
+当前 BLOCK 为 32。当前 V5 引入私有盐，旧无盐承诺及参数需要重新 diff/setup/prove。
 
 ## 15. 原文片段优化后的长度检查与兼容性
 
 enforce_source_bound(cs, consumed, old_len) 输入本步结束后的原文游标和原文总长度，无新状态返回，只添加约束。它将剩余长度分解成 8 个字节（64 位），逐个检查字节范围，并要求 consumed + remaining == old_len。游标从零开始，每步最多加 32，因此不会通过有限域绕回伪造负的剩余长度。
 
-这次改变了约束结构，产物格式升级为 V4。即使尺寸与旧版本相同，也必须重新 setup/prove，已有带承诺的 public.json 可以继续使用。原文承诺算法、块容量和新文侧处理不变。
+原文片段优化曾将格式升级到 V4；当前加入私有盐后为 V5，必须重新 diff/setup/prove。块容量和新文侧处理仍不变。
 
 ## 自动输出约束和内存统计
 
@@ -844,3 +873,22 @@ setup、prove 会输出 Nova 公共参数中的 primary/secondary R1CS 约束数
 所有命令结束时（包括普通错误返回）输出 Windows 当前工作集及进程生命周期峰值工作集，单位 MiB（1 MiB = 1,048,576 字节）。峰值包含文件加载、证明计算、序列化等，不是某个函数的内存增量，也不是峰值私有提交内存。每个命令独立运行，因而分别得到该命令的进程峰值；编译进程不计入。非 Windows 平台明确输出 unavailable。
 
 这些统计不改变电路或产物格式，不需要因此重新 setup。
+
+## 私有随机盐（V5）
+
+命令格式：
+
+~~~text
+diff <old.txt> <new.txt> <public.json> <private.salt>
+setup <public.json> <pk.bin> <vk.bin>
+prove <old.txt> <public.json> <pk.bin> <proof.bin> <private.salt>
+verify <public.json> <vk.bin> <proof.bin>
+~~~
+
+盐是由 OsRng 系统随机源通过拒绝采样生成的域元素，保存为 64 位小写十六进制（小端域编码）。diff 若发现盐文件已存在，则读取并复用；文件不存在才新建。不同承诺需要新盐时使用新的盐文件路径。盐文件应与原文一起私下保留，不发给验证者；*.salt 已加入 .gitignore。移动或更换公开 JSON 名称不会改变盐文件内容，prove 仍需显式指定对应盐。
+
+公开 z0 的末尾链槽仍为 0，但这个 0 只是首步占位。synthesize 分配私有盐，并利用操作行选择位 row_bits[0]，只在第一步把链初始化为 Poseidon(INIT_DOMAIN, 0, salt)。随后正常处理原文字节。其它步骤保持递归传入的链，不再次初始化。每步固定多生成一组候选 Poseidon 及选择约束，以保证形状不变。第一步即使是 insert 或 keep(0)，也会执行带盐初始化。
+
+不公开 salt，也不公开 h₀ 作为初始输入，避免已知 h₀ 后可绕过盐枚举原文。最终输出链值本身已经带盐。后续步骤中的盐变量不影响计算，无需增加跨步盐相等约束，首步建立的链由 Nova 连续传递。
+
+本次承诺算法和电路均改变，必须重新 diff/setup/prove，旧无盐 JSON 的承诺不能继续使用，V4 参数和证明也不能复用。相同尺寸下，改变盐的具体值仍可复用新的 V5 参数。

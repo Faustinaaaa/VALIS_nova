@@ -1048,6 +1048,7 @@ dependencies = [
  "ff",
  "generic-array 1.4.5",
  "nova-snark",
+ "rand_core",
  "serde",
  "serde_json",
 ]

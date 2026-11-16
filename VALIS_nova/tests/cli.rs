@@ -7,9 +7,15 @@ fn separate_stages_private_source_key_reuse_and_tampering() {
         .join(format!("cli-private-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let run = |args: &[&str], expected: bool| {
+        let mut command_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        if args[0] == "diff" && args.len() == 4 {
+            command_args.push(format!("{}.salt", args[3]));
+        } else if args[0] == "prove" && args.len() == 5 {
+            command_args.push(format!("{}.salt", args[2]));
+        }
         let output = Command::new(env!("CARGO_BIN_EXE_valis-nova-demo"))
             .current_dir(&dir)
-            .args(args)
+            .args(&command_args)
             .output()
             .unwrap();
         assert_eq!(
@@ -32,9 +38,22 @@ fn separate_stages_private_source_key_reuse_and_tampering() {
     assert!(public.get("before").is_none());
     assert!(!String::from_utf8_lossy(&public_bytes).contains("SECRET"));
 
+    let salt = fs::read_to_string(dir.join("public.json.salt")).unwrap();
+    assert_eq!(salt.len(), 64);
+    assert!(!String::from_utf8_lossy(&public_bytes).contains(&salt));
+    run(&["diff", "old.txt", "new.txt", "other.json"], true);
+    let other: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("other.json")).unwrap()).unwrap();
+    assert_ne!(public["before_commitment"], other["before_commitment"]);
+    // 重复 diff 使用同一盐文件，应保留承诺。
+    run(&["diff", "old.txt", "new.txt", "public.json"], true);
+    assert_eq!(public_bytes, fs::read(dir.join("public.json")).unwrap());
+    fs::rename(dir.join("public.json.salt"), dir.join("saved.salt")).unwrap();
+
     // setup 无法访问原文，因为原文件此时不存在。
     fs::remove_file(dir.join("old.txt")).unwrap();
     run(&["setup", "public.json", "pk.bin", "vk.bin"], true);
+    fs::rename(dir.join("saved.salt"), dir.join("public.json.salt")).unwrap();
     let pk_before = fs::read(dir.join("pk.bin")).unwrap();
     let vk_before = fs::read(dir.join("vk.bin")).unwrap();
     fs::write(dir.join("private.txt"), "aSECRETb").unwrap();
@@ -43,9 +62,46 @@ fn separate_stages_private_source_key_reuse_and_tampering() {
         true,
     );
     fs::remove_file(dir.join("private.txt")).unwrap();
-    // 独立验证进程只持有公开语句、vk 和压缩证明。
+    fs::rename(dir.join("public.json.salt"), dir.join("saved.salt")).unwrap();
+    // 验证进程不读取原文或私有盐。
     run(&["verify", "public.json", "vk.bin", "proof.bin"], true);
 
+    fs::rename(dir.join("saved.salt"), dir.join("public.json.salt")).unwrap();
+    fs::write(dir.join("private.txt"), "aSECRETb").unwrap();
+    run(
+        &[
+            "prove",
+            "private.txt",
+            "public.json",
+            "pk.bin",
+            "wrong-salt.bin",
+            "other.json.salt",
+        ],
+        false,
+    );
+    fs::write(dir.join("invalid.salt"), "bad salt").unwrap();
+    run(
+        &[
+            "prove",
+            "private.txt",
+            "public.json",
+            "pk.bin",
+            "invalid-salt.bin",
+            "invalid.salt",
+        ],
+        false,
+    );
+    run(
+        &[
+            "prove",
+            "private.txt",
+            "public.json",
+            "pk.bin",
+            "missing-salt.bin",
+            "missing.salt",
+        ],
+        false,
+    );
     fs::write(dir.join("bad.txt"), "xSECRETb").unwrap();
     run(
         &["prove", "bad.txt", "public.json", "pk.bin", "bad-proof.bin"],
@@ -105,6 +161,13 @@ fn separate_stages_private_source_key_reuse_and_tampering() {
     let second_source: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.join("second-source.json")).unwrap()).unwrap();
     changed["before_commitment"] = second_source["before_commitment"].clone();
+    for name in [
+        "second.json.salt",
+        "wrong-insert.json.salt",
+        "different-shape.json.salt",
+    ] {
+        fs::copy(dir.join("second-source.json.salt"), dir.join(name)).unwrap();
+    }
     fs::write(
         dir.join("second.json"),
         serde_json::to_vec(&changed).unwrap(),
@@ -203,7 +266,7 @@ fn separate_stages_private_source_key_reuse_and_tampering() {
     // 旧版参数格式仍明确拒绝，不能静默复用。
     let mut old_key = vk_before.clone();
     old_key.splice(
-        ..b"VALIS-NOVA-SOURCE-BLOCK-V4\0".len(),
+        ..b"VALIS-NOVA-DUAL-STREAM-V6\0".len(),
         b"VALIS-NOVA-PRIVATE-V1\0".iter().copied(),
     );
     fs::write(dir.join("legacy-vk.bin"), old_key).unwrap();
@@ -226,9 +289,16 @@ fn source_fragments_across_nova_steps() {
     fs::write(dir.join("old.bin"), source).unwrap();
     fs::write(dir.join("new.bin"), target).unwrap();
     for args in [
-        vec!["diff", "old.bin", "new.bin", "public.json"],
+        vec!["diff", "old.bin", "new.bin", "public.json", "private.salt"],
         vec!["setup", "public.json", "pk.bin", "vk.bin"],
-        vec!["prove", "old.bin", "public.json", "pk.bin", "proof.bin"],
+        vec![
+            "prove",
+            "old.bin",
+            "public.json",
+            "pk.bin",
+            "proof.bin",
+            "private.salt",
+        ],
         vec!["verify", "public.json", "vk.bin", "proof.bin"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_valis-nova-demo"))

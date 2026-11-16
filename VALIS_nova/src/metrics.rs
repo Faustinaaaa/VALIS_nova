@@ -1,6 +1,57 @@
 //! 只读取统计信息，不改变电路或证明格式。
 use crate::PP;
 
+/// 独立统计业务电路，避免影响 setup/prove 的计时和内存峰值。
+pub(crate) fn breakdown(
+    circuit: &crate::circuit::EditCircuit,
+) -> Result<(), nova_snark::frontend::SynthesisError> {
+    use crate::circuit::{Num, E1};
+    use nova_snark::{
+        frontend::{test_shape_cs::TestShapeCS, ConstraintSystem, SynthesisError},
+        traits::circuit::StepCircuit,
+    };
+    use std::collections::BTreeMap;
+    let mut cs = TestShapeCS::<E1>::new();
+    let z = (0..circuit.arity())
+        .map(|i| {
+            Num::alloc(cs.namespace(|| format!("input {i}")), || {
+                Err(SynthesisError::AssignmentMissing)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    circuit.synthesize(&mut cs, &z)?;
+    let mut groups = BTreeMap::<String, usize>::new();
+    for (_, _, _, path) in &cs.constraints {
+        let parts: Vec<_> = path.split('/').collect();
+        let key = if parts[0].starts_with("slot ") {
+            parts.get(1).copied().unwrap_or("other slot")
+        } else if parts[0].starts_with("source byte range ") {
+            "source byte range"
+        } else if parts[0].starts_with("target byte range ") {
+            "target byte range"
+        } else if parts[0].starts_with("payload byte range ") {
+            "payload byte range"
+        } else if parts[0].starts_with("edit column ") {
+            "edit columns"
+        } else {
+            parts[0]
+        };
+        *groups.entry(key.to_owned()).or_default() += 1;
+    }
+    let total = cs.constraints.len();
+    println!(
+        "business constraints per step: {total}; steps={}",
+        circuit.steps
+    );
+    for (name, count) in groups {
+        println!(
+            "  {name}: {count} ({:.2}%)",
+            count as f64 * 100.0 / total as f64
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn print_constraints(pp: &PP) {
     let (primary, secondary) = pp.num_constraints();
     let (primary_vars, secondary_vars) = pp.num_variables();

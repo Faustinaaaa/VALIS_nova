@@ -41,11 +41,44 @@ fn run() -> Result<()> {
     let args: Vec<_> = env::args_os().collect();
     let command = args.get(1).and_then(|s| s.to_str()).unwrap_or("");
     match (command, args.len()) {
-        ("diff", 5) => {
+        ("constraints", 3) => {
+            let public = read_statement(&args[2])?;
+            let (circuit, _) = public.circuit()?;
+            metrics::breakdown(&circuit)?;
+        }
+        ("diff", 6) => {
             distinct_paths(&[Path::new(&args[2]), Path::new(&args[4])])?;
             distinct_paths(&[Path::new(&args[3]), Path::new(&args[4])])?;
             let before = fs::read(&args[2])?;
             let after = fs::read(&args[3])?;
+            distinct_paths(&[Path::new(&args[2]), Path::new(&args[5])])?;
+            distinct_paths(&[
+                Path::new(&args[3]),
+                Path::new(&args[5]),
+                Path::new(&args[4]),
+            ])?;
+            // 已有盐文件则复用，避免重复 diff 意外丢失原来的盐。
+            let salt = match fs::read_to_string(&args[5]) {
+                Ok(text) => hashchain::decode(&text)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    use std::io::Write;
+                    let salt = hashchain::random_salt()
+                        .map_err(|error| format!("secure salt generation failed: {error}"))?;
+                    let mut options = fs::OpenOptions::new();
+                    options.write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        options.mode(0o600);
+                    }
+                    options
+                        .open(&args[5])?
+                        .write_all(hashchain::encode(salt).as_bytes())?;
+                    salt
+                }
+                Err(error) => return Err(error.into()),
+            };
+
             let start = Instant::now();
             let edits = myers_diff(&before, &after);
             let elapsed = start.elapsed();
@@ -54,7 +87,7 @@ fn run() -> Result<()> {
             }
             let public = Statement {
                 before_len: before.len(),
-                before_commitment: hashchain::encode(hashchain::commitment(&before)),
+                before_commitment: hashchain::encode(hashchain::commitment(&before, salt)),
                 after,
                 edits,
             };
@@ -87,7 +120,7 @@ fn run() -> Result<()> {
                 key_time.as_secs_f64()
             );
         }
-        ("prove", 6) => {
+        ("prove", 7) => {
             distinct_paths(&[
                 Path::new(&args[2]),
                 Path::new(&args[3]),
@@ -97,9 +130,19 @@ fn run() -> Result<()> {
             let before = fs::read(&args[2])?;
             let public = read_statement(&args[3])?;
             let (mut circuit, z0) = public.circuit()?;
+            distinct_paths(&[
+                Path::new(&args[6]),
+                Path::new(&args[2]),
+                Path::new(&args[3]),
+                Path::new(&args[4]),
+                Path::new(&args[5]),
+            ])?;
+            let salt = hashchain::decode(&fs::read_to_string(&args[6])?)?;
+            circuit.set_salt(salt);
             let tape = circuit::chunks(&public.edits);
             // new 会执行第一步，必须先装入第 0 块。首次 prove_step 仅登记该步。
             let mut source_offset = circuit.set_source_step(&before, 0, &tape[0])?;
+            let mut target_offset = circuit.set_target_step(&public.after, 0, &tape[0])?;
             let shape = Shape::from(&circuit);
             let (pp, pk): (PP, PK) = load(&args[4], "prover", &shape)?;
             metrics::print_constraints(&pp);
@@ -109,6 +152,7 @@ fn run() -> Result<()> {
             for (i, edit) in tape.iter().enumerate() {
                 if i > 0 {
                     source_offset = circuit.set_source_step(&before, source_offset, edit)?;
+                    target_offset = circuit.set_target_step(&public.after, target_offset, edit)?;
                 }
                 let phase = Instant::now();
                 recursive.prove_step(&pp, &circuit)?;
@@ -155,9 +199,10 @@ fn run() -> Result<()> {
         }
         _ => {
             return Err("usage:
-  valis-nova-demo diff <old.txt> <new.txt> <public.json>
+  valis-nova-demo constraints <public.json>
+  valis-nova-demo diff <old.txt> <new.txt> <public.json> <private.salt>
   valis-nova-demo setup <public.json> <pk.bin> <vk.bin>
-  valis-nova-demo prove <old.txt> <public.json> <pk.bin> <proof.bin>
+  valis-nova-demo prove <old.txt> <public.json> <pk.bin> <proof.bin> <private.salt>
   valis-nova-demo verify <public.json> <vk.bin> <proof.bin>"
                 .into())
         }
