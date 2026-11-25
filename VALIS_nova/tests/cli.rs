@@ -266,7 +266,7 @@ fn separate_stages_private_source_key_reuse_and_tampering() {
     // 旧版参数格式仍明确拒绝，不能静默复用。
     let mut old_key = vk_before.clone();
     old_key.splice(
-        ..b"VALIS-NOVA-DUAL-STREAM-V6\0".len(),
+        ..b"VALIS-NOVA-SCRIPT-STREAM-V7\0".len(),
         b"VALIS-NOVA-PRIVATE-V1\0".iter().copied(),
     );
     fs::write(dir.join("legacy-vk.bin"), old_key).unwrap();

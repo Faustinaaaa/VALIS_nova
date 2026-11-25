@@ -141,6 +141,7 @@ fn run() -> Result<()> {
             circuit.set_salt(salt);
             let tape = circuit::chunks(&public.edits);
             // new 会执行第一步，必须先装入第 0 块。首次 prove_step 仅登记该步。
+            circuit.set_edit_step(&tape[0]);
             let mut source_offset = circuit.set_source_step(&before, 0, &tape[0])?;
             let mut target_offset = circuit.set_target_step(&public.after, 0, &tape[0])?;
             let shape = Shape::from(&circuit);
@@ -151,6 +152,7 @@ fn run() -> Result<()> {
             let mut recursive_time = phase.elapsed();
             for (i, edit) in tape.iter().enumerate() {
                 if i > 0 {
+                    circuit.set_edit_step(edit);
                     source_offset = circuit.set_source_step(&before, source_offset, edit)?;
                     target_offset = circuit.set_target_step(&public.after, target_offset, edit)?;
                 }

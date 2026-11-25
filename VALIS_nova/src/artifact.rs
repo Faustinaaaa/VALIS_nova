@@ -6,7 +6,7 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-const MAGIC: &[u8] = b"VALIS-NOVA-DUAL-STREAM-V6\0";
+const MAGIC: &[u8] = b"VALIS-NOVA-SCRIPT-STREAM-V7\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Shape {

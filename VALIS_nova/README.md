@@ -1,3 +1,5 @@
+> 当前为 V7：原文、新文和操作块都按步骤输入；操作表已改为脚本哈希链，递归状态固定 10 个元素。详细调用顺序和电路规则见 [SCRIPT_STREAM.md](SCRIPT_STREAM.md)，测试结果见 [BENCHMARK_V7.md](BENCHMARK_V7.md)。下文 V6 及更早的完整操作表描述为历史方案。V6 密钥需要重新 setup。
+
 # Nova 私有原文编辑证明
 
 使用 nova-snark 0.76.0（Pallas/Vesta + Spartan/IPA），将 Myers 差异拆成每块最多 32 个字节，再逐步证明编辑过程。每步只将当前块的最多 32 字节原文作为私有 witness，新文和差异脚本作为公开输入。

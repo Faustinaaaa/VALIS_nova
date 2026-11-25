@@ -35,22 +35,12 @@ impl Statement {
         }
         // 即使没有操作，也至少保留一步；后面的 chunks 会生成 keep(0)。
         let blocks = blocks.max(1);
-        // 计算初始状态需要多少个 F 元素，不是计算文件有多少字节。
-        let state_len = blocks
-            .checked_mul(2 + BLOCK)
-            .and_then(|n| n.checked_add(8))
-            .ok_or("encoded state size overflow")?;
-        // 检查两个数组的大小：初始状态数组，以及固定容量的私有原文片段。
-        for len in [state_len, BLOCK] {
-            if len
-                // 元素数量乘以一个 F 占用的字节数，得到数组所需的字节数。
-                .checked_mul(std::mem::size_of::<F>())
-                // 乘法溢出，或超过 Vec 允许的分配大小，就拒绝。
-                // 这里只检查大小是否合法，不保证机器有足够的空闲内存。
-                .is_none_or(|bytes| bytes > isize::MAX as usize)
-            {
-                return Err("input allocation size overflow".into());
-            }
+        // 状态固定为 10 个域元素；这里只检查电路外操作块数组的分配大小。
+        if blocks
+            .checked_mul(std::mem::size_of::<Edit>())
+            .is_none_or(|bytes| bytes > isize::MAX as usize)
+        {
+            return Err("input allocation size overflow".into());
         }
         // 真正拆分脚本，得到每块最多 BLOCK 字节的操作列表 tape。
         let tape = chunks(&self.edits);

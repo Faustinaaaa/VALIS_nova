@@ -6,7 +6,7 @@ use nova_snark::{
     traits::{circuit::StepCircuit, Engine},
 };
 
-use crate::gadgets::{enforce_byte, enforce_source_bound, equal_if, select, selectors, sum};
+use crate::gadgets::{enforce_byte, enforce_source_bound, equal_if, selectors, sum};
 
 // Pallas/Vesta 构成 Nova 使用的曲线循环；业务电路在 E1 的标量域 F 上计算。
 pub(crate) type E1 = PallasEngine;
@@ -54,7 +54,7 @@ pub(crate) fn chunks(edits: &[Edit]) -> Vec<Edit> {
 }
 
 /// 在 BLOCK 和约束逻辑固定时，形状由两份文本长度及操作块数决定。
-/// 状态：[三个游标, 原文长度, 新文承诺, 新文链, 操作表..., 原文承诺, 原文链]。
+/// 状态：[三个游标, 原文长度, 新文承诺, 新文链, 脚本承诺, 脚本链, 原文承诺, 原文链]。
 /// 原文只分配为私有 witness，不进入递归输入/输出或最终公开证明状态。
 /// 末尾追加目标承诺和动态哈希链；消费的原文字节绑定到公开承诺。
 #[derive(Clone, Debug)]
@@ -68,6 +68,28 @@ pub(crate) struct EditCircuit {
     target_block: [F; BLOCK],
     // 私有盐只在首步初始化链时使用，不进入公开状态。
     salt: F,
+    operation_block: [F; ROW],
+}
+
+pub(crate) fn encode_edit(edit: &Edit) -> [F; ROW] {
+    let mut row = [F::ZERO; ROW];
+    match edit {
+        Edit::Keep(n) => row[1] = scalar(*n),
+        Edit::Delete(n) => {
+            row[0] = F::ONE;
+            row[1] = scalar(*n);
+        }
+        Edit::Insert(text) => {
+            let chars = text;
+            assert!(chars.len() <= BLOCK);
+            row[0] = scalar(2);
+            row[1] = scalar(chars.len());
+            for (i, ch) in chars.iter().enumerate() {
+                row[i + 2] = F::from(*ch as u64);
+            }
+        }
+    }
+    row
 }
 
 impl EditCircuit {
@@ -85,38 +107,23 @@ impl EditCircuit {
             source_block: [F::ZERO; BLOCK],
             target_block: [F::ZERO; BLOCK],
             salt: F::ZERO,
+            operation_block: [F::ZERO; ROW],
         };
         // 三个游标从 0 开始；仅原文长度公开，原文字节不会写入 z0。
         let mut state = vec![F::ZERO; 3];
         state.push(scalar(old_len));
         state.push(crate::hashchain::target_commitment(new));
         state.push(F::ZERO);
-        for edit in tape {
-            // 操作类型：0=keep，1=delete，2=insert。
-            // 所有插入槽位先填零，只有 insert 的有效部分写入字节值。
-            // 填充零不代表真实文本中的空字节；是否处理该槽位由有效长度决定。
-            let mut row = [F::ZERO; ROW];
-            match edit {
-                Edit::Keep(n) => row[1] = scalar(*n),
-                Edit::Delete(n) => {
-                    row[0] = F::ONE;
-                    row[1] = scalar(*n);
-                }
-                Edit::Insert(text) => {
-                    let chars = text;
-                    assert!(chars.len() <= BLOCK);
-                    row[0] = scalar(2);
-                    row[1] = scalar(chars.len());
-                    for (i, ch) in chars.iter().enumerate() {
-                        row[i + 2] = F::from(*ch as u64);
-                    }
-                }
-            }
-            state.extend(row);
-        }
+        state.push(crate::hashchain::script_commitment(tape));
+        state.push(F::ZERO);
         state.push(commitment);
         state.push(F::ZERO);
         (circuit, state)
+    }
+
+    /// 每步只装入当前操作；脚本链负责绑定公开脚本及顺序。
+    pub(crate) fn set_edit_step(&mut self, edit: &Edit) {
+        self.operation_block = encode_edit(edit);
     }
 
     pub(crate) fn set_salt(&mut self, salt: F) {
@@ -188,7 +195,10 @@ impl EditCircuit {
             && initial[initial.len() - 1] == F::ZERO
             && initial[5] == F::ZERO
             && output[3..5] == initial[3..5]
-            && output[6..output.len() - 1] == initial[6..initial.len() - 1]
+            && initial[7] == F::ZERO
+            && output[6] == initial[6]
+            && output[8] == initial[8]
+            && crate::hashchain::script_finish(output[7], self.steps) == initial[6]
             && crate::hashchain::target_finish(output[5], self.new_len) == initial[4]
             && crate::hashchain::finish(output[output.len() - 1], self.old_len)
                 == initial[initial.len() - 2]
@@ -196,9 +206,9 @@ impl EditCircuit {
 }
 
 impl StepCircuit<F> for EditCircuit {
-    /// 新文全文不再进入状态，只有两个承诺、两条链和操作表。
+    /// 新文全文不再进入状态，只有三个承诺、三条链和游标。
     fn arity(&self) -> usize {
-        8 + ROW * self.steps
+        10
     }
 
     /// 为一个编辑块生成 R1CS 约束；不能根据本步操作类型减少或增加约束。
@@ -218,7 +228,7 @@ impl StepCircuit<F> for EditCircuit {
         for (i, byte) in old.iter().enumerate() {
             enforce_byte(cs.namespace(|| format!("source byte range {i}")), byte)?;
         }
-        // 从z中取出新文和操作表
+        // 将公开原文长度绑定到 setup 使用的长度。
         cs.enforce(
             || "source length matches shape",
             |lc| lc + z[3].get_variable(),
@@ -235,33 +245,67 @@ impl StepCircuit<F> for EditCircuit {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let tape = &z[6..z.len() - 2];
+
         let mut target_chain = z[5].clone();
         let mut chain = z[z.len() - 1].clone();
         for (i, byte) in new.iter().enumerate() {
             enforce_byte(cs.namespace(|| format!("target byte range {i}")), byte)?;
         }
-        // 根据操作游标 z[2] 选择当前操作行；得到这一行的所有列，包括操作类型、有效长度和 32 个插入字节槽位。
+        // 当前操作作为 witness 输入，脚本哈希链绑定其内容及执行顺序。
         let one = sum(cs.namespace(|| "constant one"), &[], 1)?;
-        let row_bits = selectors(cs.namespace(|| "edit position"), &z[2], &one, self.steps)?;
+        // first 精确表示操作游标是否为零，用来初始化私有盐。
+        let first = Num::alloc(cs.namespace(|| "first step"), || {
+            Ok(
+                if z[2].get_value().ok_or(SynthesisError::AssignmentMissing)? == F::ZERO {
+                    F::ONE
+                } else {
+                    F::ZERO
+                },
+            )
+        })?;
+        let inverse = Num::alloc(cs.namespace(|| "cursor inverse"), || {
+            Ok(Option::<F>::from(
+                z[2].get_value()
+                    .ok_or(SynthesisError::AssignmentMissing)?
+                    .invert(),
+            )
+            .unwrap_or(F::ZERO))
+        })?;
+        cs.enforce(
+            || "first zero",
+            |lc| lc + z[2].get_variable(),
+            |lc| lc + first.get_variable(),
+            |lc| lc,
+        );
+        cs.enforce(
+            || "first nonzero",
+            |lc| lc + z[2].get_variable(),
+            |lc| lc + inverse.get_variable(),
+            |lc| lc + CS::one() - first.get_variable(),
+        );
         let salt = Num::alloc(cs.namespace(|| "private salt"), || Ok(self.salt))?;
         chain = crate::hashchain::initialize_if(
             cs.namespace(|| "salted initialization"),
             &chain,
             &salt,
-            &row_bits[0],
+            &first,
         )?;
-        let mut row = Vec::new();
-        for column in 0..ROW {
-            let entries = (0..self.steps)
-                .map(|i| tape[i * ROW + column].clone())
-                .collect::<Vec<_>>();
-            row.push(select(
-                cs.namespace(|| format!("edit column {column}")),
-                &row_bits,
-                &entries,
-            )?);
-        }
+        let row = self
+            .operation_block
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                Num::alloc(cs.namespace(|| format!("operation witness {i}")), || {
+                    Ok(*value)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let script_chain = crate::hashchain::script_absorb(
+            cs.namespace(|| "script hashchain"),
+            &z[7],
+            &row,
+            &one,
+        )?;
         for slot in 0..BLOCK {
             enforce_byte(
                 cs.namespace(|| format!("payload byte range {slot}")),
@@ -334,7 +378,9 @@ impl StepCircuit<F> for EditCircuit {
         next[1] = sum(cs.namespace(|| "advance new cursor"), &new_increments, 0)?;
         enforce_source_bound(cs.namespace(|| "target bound"), &next[1], self.new_len)?;
         next[2] = sum(cs.namespace(|| "advance edit cursor"), &[z[2].clone()], 1)?;
-        // 公开的新文、脚本及原文长度直接复用变量，不能在步骤间替换。
+        // 公开承诺和原文长度保持不变；只更新三个游标和三条链。
+        enforce_source_bound(cs.namespace(|| "script bound"), &next[2], self.steps)?;
+        next[7] = script_chain;
         let last = next.len() - 1;
         next[last] = chain;
         next[5] = target_chain;
@@ -378,6 +424,7 @@ mod tests {
         let mut offset = 0;
         let mut target_offset = 0;
         for edit in &tape {
+            c.set_edit_step(edit);
             let previous = offset;
             let target_previous = target_offset;
             offset = c.set_source_step(source, offset, edit).unwrap();
@@ -397,6 +444,41 @@ mod tests {
             z = next;
         }
         c.completed(&z0, &z)
+    }
+
+    #[test]
+    fn script_chain_binds_order_padding_and_complete_sequence() {
+        let source = b"abc";
+        let tape = [Edit::Delete(1), Edit::Delete(2)];
+        let (mut c, z0) =
+            EditCircuit::statement(3, b"", &tape, hashchain::commitment(source, F::from(7)));
+        c.set_salt(F::from(7));
+        // 两种脚本都能删除同一原文，但只有公开指定的顺序能被接受。
+        for (edits, poison, expected) in [
+            (vec![Edit::Delete(1), Edit::Delete(2)], false, true),
+            (vec![Edit::Delete(2), Edit::Delete(1)], false, false),
+            (vec![Edit::Delete(1), Edit::Delete(2)], true, false),
+            (vec![Edit::Delete(1)], false, false),
+        ] {
+            let mut z = z0.clone();
+            let mut offset = 0;
+            for edit in &edits {
+                c.set_edit_step(edit);
+                if poison {
+                    c.operation_block[2] = F::ONE;
+                }
+                offset = c.set_source_step(source, offset, edit).unwrap();
+                let (next, ok, _) = step(&c, &z);
+                assert!(ok);
+                z = next;
+            }
+            assert_eq!(c.completed(&z0, &z), expected);
+        }
+        let (a, za) = EditCircuit::statement(3, b"", &tape[..1], F::ZERO);
+        let (b, zb) = EditCircuit::statement(3, b"", &vec![Edit::Delete(1); 128], F::ZERO);
+        assert_eq!(za.len(), 10);
+        assert_eq!(zb.len(), 10);
+        assert_eq!(step(&a, &za).2, step(&b, &zb).2);
     }
 
     #[test]
@@ -525,6 +607,7 @@ mod tests {
         let mut z = z0.clone();
         let mut offset = 0;
         for edit in &tape {
+            c.set_edit_step(edit);
             c.set_source_step(&swapped, offset, edit).unwrap();
             offset = c.set_target_step(&swapped, offset, edit).unwrap();
             let (next, ok, _) = step(&c, &z);
@@ -554,7 +637,7 @@ mod tests {
         let (a, za) = EditCircuit::statement(32, &[0; 32], &tape, F::ZERO);
         let (b, zb) = EditCircuit::statement(32, &[0; 2048], &tape, F::ZERO);
         assert_eq!(a.arity(), b.arity());
-        assert_eq!(a.arity(), 8 + ROW);
+        assert_eq!(a.arity(), 10);
         assert_eq!(step(&a, &za).2, step(&b, &zb).2);
     }
 }

@@ -126,23 +126,6 @@ pub(crate) fn selectors<CS: ConstraintSystem<F>>(
     Ok(bits)
 }
 
-/// 返回 sum(bits[i] × entries[i])；选择位须由 selectors 等约束组件生成。
-/// 独热时返回指定元素，全零时返回 0；这里不会重新约束选择位的独热性质。
-pub(crate) fn select<CS: ConstraintSystem<F>>(
-    mut cs: CS,
-    bits: &[Num],
-    entries: &[Num],
-) -> Result<Num, SynthesisError> {
-    assert_eq!(bits.len(), entries.len());
-    let products = bits
-        .iter()
-        .zip(entries)
-        .enumerate()
-        .map(|(i, (bit, entry))| bit.mul(cs.namespace(|| format!("selected value {i}")), entry))
-        .collect::<Result<Vec<_>, _>>()?;
-    sum(cs.namespace(|| "lookup result"), &products, 0)
-}
-
 /// 条件相等约束：enabled × (a - b) = 0。
 /// enabled=1 时强制 a=b，enabled=0 时不限制二者；布尔性由调用方保证。
 pub(crate) fn equal_if<CS: ConstraintSystem<F>>(mut cs: CS, enabled: &Num, a: &Num, b: &Num) {
